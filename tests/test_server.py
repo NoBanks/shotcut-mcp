@@ -33,12 +33,16 @@ from shotcut_mcp.server import call_tool, list_tools
 
 
 @pytest.mark.asyncio
-async def test_list_tools_registers_nine_tools():
+async def test_list_tools_registers_all_tools():
     tools = await list_tools()
     names = {t.name for t in tools}
     assert names == {
         "create_project",
         "add_clip",
+        "trim_clip",
+        "remove_clip",
+        "move_clip",
+        "get_timeline",
         "split_clip",
         "remove_segment",
         "append_text_overlay",
@@ -162,10 +166,13 @@ def test_mlt_project_text_overlay_in_xml():
     proj.add_clip("/fake/clip.mp4", in_s=0.0, out_s=10.0)
     proj.append_text_overlay("HELLO", start_s=2.0, end_s=5.0)
     root = ET.fromstring(proj.to_xml())
-    text_prods = [p for p in root.findall("producer")
-                  if any(prop.get("name") == "mlt_service" and prop.text == "text:html"
-                         for prop in p.findall("property"))]
-    assert len(text_prods) == 1
+    tractor = root.find("./tractor[@id='tractor0']")
+    text_filters = [f for f in tractor.findall("filter")
+                    if any(prop.get("name") == "mlt_service" and prop.text == "qtext"
+                           for prop in f.findall("property"))]
+    assert len(text_filters) == 1
+    assert text_filters[0].get("in") == "50"
+    assert text_filters[0].get("out") == "124"
 
 
 def test_mlt_project_apply_filter_invalid_raises():
@@ -321,26 +328,34 @@ async def test_render_mocked(tmp_path, monkeypatch):
     from shotcut_mcp.server import call_tool as ct
 
     await ct("create_project", {"name": "render_test"})
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"not really video")
+    monkeypatch.setattr(srv, "probe_duration_s", lambda path: 4.0)
+    await ct("add_clip", {"project_name": "render_test", "clip_path": str(clip)})
     output_path = str(tmp_path / "output.mp4")
-    # Create a dummy output file so stat succeeds
-    Path(output_path).write_bytes(b"dummy")
 
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stderr = "Current Frame: 49, percentage: 98"
-    mock_result.stdout = ""
+    class FakeProc:
+        returncode = 0
 
-    with patch("shotcut_mcp.server.subprocess.run", return_value=mock_result):
-        result = await ct("render", {
-            "project_name": "render_test",
-            "output_path": output_path,
-            "preset": "mp4-1080p",
-        })
+        async def communicate(self):
+            Path(output_path).write_bytes(b"dummy")
+            return b"", b""
+
+    async def fake_exec(*cmd, **kwargs):
+        assert "terminate_on_pause=1" in cmd
+        return FakeProc()
+
+    monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+    result = await ct("render", {
+        "project_name": "render_test",
+        "output_path": output_path,
+        "preset": "mp4-1080p",
+    })
     data = json.loads(result[0].text)
     assert data["output_path"] == output_path
     assert data["preset"] == "mp4-1080p"
-    assert data["duration_s"] >= 0
-    assert data["file_size_bytes"] >= 0
+    assert data["render_time_s"] >= 0
+    assert data["file_size_bytes"] > 0
 
 
 @pytest.mark.asyncio

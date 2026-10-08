@@ -1,11 +1,12 @@
 """Shotcut MCP Server - programmatic MLT/Shotcut video editing via melt."""
 
+import asyncio
 import json
 import os
+import shutil
 import subprocess
-import asyncio
+import time
 from pathlib import Path
-from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -18,12 +19,16 @@ from .schemas import (
     AppendTextOverlayInput,
     ApplyFilterInput,
     CreateProjectInput,
+    GetTimelineInput,
     ListProjectsInput,
+    MoveClipInput,
     ProjectInfoInput,
+    RemoveClipInput,
     RemoveSegmentInput,
     RenderInput,
     SetTransitionInput,
     SplitClipInput,
+    TrimClipInput,
 )
 
 APP_NAME = "shotcut-mcp"
@@ -31,29 +36,20 @@ server = Server(APP_NAME)
 
 WORKDIR = Path(os.environ.get("SHOTCUT_MCP_WORKDIR", "~/shotcut-mcp-projects")).expanduser()
 MELT_BIN = os.environ.get("MELT_BIN", "melt")
+FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 
+# "project" renders at the project's own frame size (keeps vertical projects vertical).
+_X264 = {"vcodec": "libx264", "preset": "veryfast", "crf": "20", "pix_fmt": "yuv420p",
+         "acodec": "aac", "ar": "48000", "ab": "192k", "movflags": "+faststart"}
 RENDER_PRESETS = {
-    "mp4-1080p": {
-        "vcodec": "libx264",
-        "s": "1920x1080",
-        "acodec": "aac",
-        "ar": "48000",
-        "ab": "256k",
-    },
-    "mp4-720p": {
-        "vcodec": "libx264",
-        "s": "1280x720",
-        "acodec": "aac",
-        "ar": "48000",
-        "ab": "256k",
-    },
-    "audio-only": {
-        "acodec": "aac",
-        "ar": "48000",
-        "ab": "256k",
-        "vn": "1",
-    },
+    "mp4-project": dict(_X264),
+    "mp4-1080p": {**_X264, "s": "1920x1080"},
+    "mp4-720p": {**_X264, "s": "1280x720"},
+    "audio-only": {"acodec": "aac", "ar": "48000", "ab": "256k", "vn": "1"},
 }
+
+_PROJECT = {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$"}
+_PID = {"type": "string", "minLength": 1}
 
 
 def _ensure_workdir() -> None:
@@ -71,379 +67,374 @@ def _load_project(name: str) -> MltProject:
     return MltProject.load(str(p))
 
 
-def _save_project(proj: MltProject) -> None:
-    proj.save(str(_project_path(proj.name)))
+def _save_project(proj: MltProject, name: str) -> None:
+    proj.save(str(_project_path(name)))
+
+
+def _ok(payload: dict) -> list[TextContent]:
+    return [TextContent(type="text", text=json.dumps(payload))]
 
 
 def _err(msg: str, code: str) -> list[TextContent]:
-    return [TextContent(type="text", text=json.dumps({"error": msg, "code": code}))]
+    return _ok({"error": msg, "code": code})
+
+
+def probe_duration_s(path: str) -> float | None:
+    """Container duration in seconds via ffprobe, or None when unavailable."""
+    if not shutil.which(FFPROBE_BIN) and not Path(FFPROBE_BIN).exists():
+        return None
+    try:
+        out = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(out.stdout.strip())
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
+TOOLS = [
+    Tool(
+        name="create_project",
+        description="Create a new empty MLT/Shotcut project. Choose width/height to match the delivery (e.g. 1080x1920 for vertical).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name": _PROJECT,
+                "width": {"type": "integer", "default": 1920},
+                "height": {"type": "integer", "default": 1080},
+                "fps": {"type": "number", "default": 25.0},
+            },
+            "required": ["name"],
+        },
+    ),
+    Tool(
+        name="add_clip",
+        description="Append a span of a source video to the end of the timeline. in_s/out_s are seconds in the SOURCE file. Returns the clip's producer_id.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_name": _PROJECT,
+                "clip_path": {"type": "string", "minLength": 1},
+                "in_s": {"type": "number", "default": 0.0},
+                "out_s": {"type": "number"},
+            },
+            "required": ["project_name", "clip_path"],
+        },
+    ),
+    Tool(
+        name="trim_clip",
+        description="Change the source in/out points of a clip already on the timeline.",
+        inputSchema={
+            "type": "object",
+            "properties": {"project_name": _PROJECT, "producer_id": _PID,
+                           "in_s": {"type": "number"}, "out_s": {"type": "number"}},
+            "required": ["project_name", "producer_id"],
+        },
+    ),
+    Tool(
+        name="remove_clip",
+        description="Ripple-delete one clip from the timeline.",
+        inputSchema={
+            "type": "object",
+            "properties": {"project_name": _PROJECT, "producer_id": _PID},
+            "required": ["project_name", "producer_id"],
+        },
+    ),
+    Tool(
+        name="move_clip",
+        description="Move a clip to a new 1-based position on the timeline.",
+        inputSchema={
+            "type": "object",
+            "properties": {"project_name": _PROJECT, "producer_id": _PID,
+                           "to_position": {"type": "integer", "minimum": 1}},
+            "required": ["project_name", "producer_id", "to_position"],
+        },
+    ),
+    Tool(
+        name="split_clip",
+        description="Split a clip at_s seconds after its own in point.",
+        inputSchema={
+            "type": "object",
+            "properties": {"project_name": _PROJECT, "producer_id": _PID, "at_s": {"type": "number"}},
+            "required": ["project_name", "producer_id", "at_s"],
+        },
+    ),
+    Tool(
+        name="remove_segment",
+        description="Ripple-delete the timeline span between start_s and end_s.",
+        inputSchema={
+            "type": "object",
+            "properties": {"project_name": _PROJECT, "start_s": {"type": "number"}, "end_s": {"type": "number"}},
+            "required": ["project_name", "start_s", "end_s"],
+        },
+    ),
+    Tool(
+        name="append_text_overlay",
+        description="Burn a text title onto the timeline between start_s and end_s (timeline seconds).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_name": _PROJECT,
+                "text": {"type": "string", "minLength": 1, "maxLength": 256},
+                "start_s": {"type": "number"},
+                "end_s": {"type": "number"},
+                "font_size": {"type": "integer", "default": 48},
+                "color": {"type": "string", "default": "#ffffff"},
+                "bg_color": {"type": "string", "default": "#80000000"},
+                "halign": {"type": "string", "enum": ["left", "center", "right"], "default": "center"},
+                "valign": {"type": "string", "enum": ["top", "middle", "bottom"], "default": "bottom"},
+            },
+            "required": ["project_name", "text", "start_s", "end_s"],
+        },
+    ),
+    Tool(
+        name="apply_filter",
+        description=(
+            f"Apply a filter to a clip. Allowed: {sorted(ALLOWED_FILTERS)}. "
+            "Fades take params {\"duration_s\": n}; brightness takes {\"level\": 0-2}; "
+            "volume takes {\"level\": dB}; crop takes {\"left\",\"right\",\"top\",\"bottom\"} in pixels."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_name": _PROJECT,
+                "producer_id": _PID,
+                "filter_name": {"type": "string", "enum": sorted(ALLOWED_FILTERS)},
+                "params": {"type": "object", "default": {}},
+            },
+            "required": ["project_name", "producer_id", "filter_name"],
+        },
+    ),
+    Tool(
+        name="set_transition",
+        description="Crossfade (video dissolve + audio mix) between two ADJACENT clips. Shortens the timeline by duration_s.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_name": _PROJECT,
+                "from_producer_id": _PID,
+                "to_producer_id": _PID,
+                "duration_s": {"type": "number", "exclusiveMinimum": 0},
+                "style": {"type": "string", "default": "luma"},
+            },
+            "required": ["project_name", "from_producer_id", "to_producer_id", "duration_s"],
+        },
+    ),
+    Tool(
+        name="get_timeline",
+        description="Return the whole edit: every clip with producer_id, source in/out, timeline start/end, filters, transitions and titles.",
+        inputSchema={"type": "object", "properties": {"project_name": _PROJECT}, "required": ["project_name"]},
+    ),
+    Tool(
+        name="project_info",
+        description="Return summary metadata about an existing project.",
+        inputSchema={"type": "object", "properties": {"project_name": _PROJECT}, "required": ["project_name"]},
+    ),
+    Tool(
+        name="render",
+        description="Render a project to a video file with melt. 'mp4-project' keeps the project's own frame size.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project_name": _PROJECT,
+                "output_path": {"type": "string", "minLength": 1},
+                "preset": {"type": "string", "enum": list(RENDER_PRESETS.keys()), "default": "mp4-1080p"},
+            },
+            "required": ["project_name", "output_path"],
+        },
+    ),
+    Tool(
+        name="list_projects",
+        description="List all .mlt project files in the work directory.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+]
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="create_project",
-            description="Create a new empty MLT/Shotcut project file.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "minLength": 1, "maxLength": 64},
-                    "width": {"type": "integer", "default": 1920},
-                    "height": {"type": "integer", "default": 1080},
-                    "fps": {"type": "number", "default": 25.0},
-                },
-                "required": ["name"],
-            },
-        ),
-        Tool(
-            name="add_clip",
-            description="Append a video/audio clip to the project timeline.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "project_name": {"type": "string", "minLength": 1, "maxLength": 64},
-                    "clip_path": {"type": "string", "minLength": 1},
-                    "in_s": {"type": "number", "default": 0.0},
-                    "out_s": {"type": "number"},
-                },
-                "required": ["project_name", "clip_path"],
-            },
-        ),
-        Tool(
-            name="split_clip",
-            description="Split an existing clip at a timeline offset.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "project_name": {"type": "string", "minLength": 1, "maxLength": 64},
-                    "producer_id": {"type": "string", "minLength": 1},
-                    "at_s": {"type": "number"},
-                },
-                "required": ["project_name", "producer_id", "at_s"],
-            },
-        ),
-        Tool(
-            name="remove_segment",
-            description="Ripple-delete a timeline segment between start_s and end_s.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "project_name": {"type": "string", "minLength": 1, "maxLength": 64},
-                    "start_s": {"type": "number"},
-                    "end_s": {"type": "number"},
-                },
-                "required": ["project_name", "start_s", "end_s"],
-            },
-        ),
-        Tool(
-            name="append_text_overlay",
-            description="Burn a text overlay onto the timeline between start_s and end_s.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "project_name": {"type": "string", "minLength": 1, "maxLength": 64},
-                    "text": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "start_s": {"type": "number"},
-                    "end_s": {"type": "number"},
-                    "font_size": {"type": "integer", "default": 48},
-                    "color": {"type": "string", "default": "#ffffff"},
-                    "bg_color": {"type": "string", "default": "#80000000"},
-                    "halign": {"type": "string", "default": "center"},
-                    "valign": {"type": "string", "default": "bottom"},
-                },
-                "required": ["project_name", "text", "start_s", "end_s"],
-            },
-        ),
-        Tool(
-            name="apply_filter",
-            description=f"Apply a filter to a clip. Allowed: {sorted(ALLOWED_FILTERS)}",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "project_name": {"type": "string", "minLength": 1, "maxLength": 64},
-                    "producer_id": {"type": "string", "minLength": 1},
-                    "filter_name": {"type": "string"},
-                    "params": {"type": "object", "default": {}},
-                },
-                "required": ["project_name", "producer_id", "filter_name"],
-            },
-        ),
-        Tool(
-            name="set_transition",
-            description="Add a luma crossfade transition between two adjacent clips.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "project_name": {"type": "string", "minLength": 1, "maxLength": 64},
-                    "from_producer_id": {"type": "string", "minLength": 1},
-                    "to_producer_id": {"type": "string", "minLength": 1},
-                    "duration_s": {"type": "number"},
-                    "style": {"type": "string", "default": "luma"},
-                },
-                "required": ["project_name", "from_producer_id", "to_producer_id", "duration_s"],
-            },
-        ),
-        Tool(
-            name="project_info",
-            description="Return metadata about an existing project.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "project_name": {"type": "string", "minLength": 1, "maxLength": 64},
-                },
-                "required": ["project_name"],
-            },
-        ),
-        Tool(
-            name="render",
-            description="Render a project to an output video file using melt.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "project_name": {"type": "string", "minLength": 1, "maxLength": 64},
-                    "output_path": {"type": "string", "minLength": 1},
-                    "preset": {
-                        "type": "string",
-                        "enum": list(RENDER_PRESETS.keys()),
-                        "default": "mp4-1080p",
-                    },
-                },
-                "required": ["project_name", "output_path"],
-            },
-        ),
-        Tool(
-            name="list_projects",
-            description="List all .mlt project files in the work directory.",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-            },
-        ),
-    ]
+    return TOOLS
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     _ensure_workdir()
+    handlers = {
+        "create_project": (CreateProjectInput, _create_project),
+        "add_clip": (AddClipInput, _add_clip),
+        "trim_clip": (TrimClipInput, _trim_clip),
+        "remove_clip": (RemoveClipInput, _remove_clip),
+        "move_clip": (MoveClipInput, _move_clip),
+        "split_clip": (SplitClipInput, _split_clip),
+        "remove_segment": (RemoveSegmentInput, _remove_segment),
+        "append_text_overlay": (AppendTextOverlayInput, _append_text_overlay),
+        "apply_filter": (ApplyFilterInput, _apply_filter),
+        "set_transition": (SetTransitionInput, _set_transition),
+        "get_timeline": (GetTimelineInput, _get_timeline),
+        "project_info": (ProjectInfoInput, _project_info),
+        "render": (RenderInput, _render),
+        "list_projects": (ListProjectsInput, _list_projects),
+    }
+    if name not in handlers:
+        return _err(f"Unknown tool: {name}", "unknown_tool")
+    model, handler = handlers[name]
     try:
-        if name == "create_project":
-            return await _create_project(CreateProjectInput(**arguments))
-        elif name == "add_clip":
-            return await _add_clip(AddClipInput(**arguments))
-        elif name == "split_clip":
-            return await _split_clip(SplitClipInput(**arguments))
-        elif name == "remove_segment":
-            return await _remove_segment(RemoveSegmentInput(**arguments))
-        elif name == "append_text_overlay":
-            return await _append_text_overlay(AppendTextOverlayInput(**arguments))
-        elif name == "apply_filter":
-            return await _apply_filter(ApplyFilterInput(**arguments))
-        elif name == "set_transition":
-            return await _set_transition(SetTransitionInput(**arguments))
-        elif name == "project_info":
-            return await _project_info(ProjectInfoInput(**arguments))
-        elif name == "render":
-            return await _render(RenderInput(**arguments))
-        elif name == "list_projects":
-            return await _list_projects(ListProjectsInput(**arguments))
-        else:
-            return _err(f"Unknown tool: {name}", "unknown_tool")
+        return await handler(model(**(arguments or {})))
     except FileNotFoundError as e:
         return _err(str(e), "project_not_found")
+    except KeyError as e:
+        return _err(f"Producer not found: {e.args[0]}", "producer_not_found")
     except ValueError as e:
         return _err(str(e), "validation_error")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - surface anything else to the agent as data
         return _err(str(e), "internal_error")
 
 
 async def _create_project(inp: CreateProjectInput) -> list[TextContent]:
     proj = MltProject(name=inp.name, width=inp.width, height=inp.height, fps=inp.fps)
-    _save_project(proj)
-    path = str(_project_path(inp.name))
-    return [TextContent(type="text", text=json.dumps({
-        "project_path": path,
-        "name": inp.name,
-        "width": inp.width,
-        "height": inp.height,
-        "fps": inp.fps,
-    }))]
+    _save_project(proj, inp.name)
+    return _ok({"project_path": str(_project_path(inp.name)), "name": inp.name,
+                "width": inp.width, "height": inp.height, "fps": inp.fps})
 
 
 async def _add_clip(inp: AddClipInput) -> list[TextContent]:
-    clip_path = Path(inp.clip_path)
-    if not clip_path.exists():
+    if not Path(inp.clip_path).exists():
         return _err(f"Clip file not found: {inp.clip_path}", "clip_not_found")
+    source_duration = probe_duration_s(inp.clip_path)
+    out_s = inp.out_s
+    if source_duration is not None:
+        if inp.in_s >= source_duration:
+            return _err(f"in_s {inp.in_s} is past the end of the source ({source_duration:.3f}s)", "validation_error")
+        if out_s is None or out_s > source_duration:
+            out_s = source_duration if out_s is None else min(out_s, source_duration)
     proj = _load_project(inp.project_name)
     timeline_pos = proj.project_duration_s()
-    producer_id = proj.add_clip(
-        path=inp.clip_path,
-        in_s=inp.in_s,
-        out_s=inp.out_s,
-    )
-    _save_project(proj)
-    out_s = inp.out_s if inp.out_s is not None else (proj.project_duration_s() - timeline_pos + inp.in_s)
-    return [TextContent(type="text", text=json.dumps({
-        "producer_id": producer_id,
-        "clip_path": inp.clip_path,
-        "in_s": inp.in_s,
-        "out_s": out_s,
-        "timeline_position_s": timeline_pos,
-    }))]
+    producer_id = proj.add_clip(path=inp.clip_path, in_s=inp.in_s, out_s=out_s)
+    _save_project(proj, inp.project_name)
+    return _ok({"producer_id": producer_id, "clip_path": inp.clip_path, "in_s": inp.in_s,
+                "out_s": out_s, "timeline_position_s": round(timeline_pos, 3),
+                "source_duration_s": source_duration})
+
+
+async def _trim_clip(inp: TrimClipInput) -> list[TextContent]:
+    proj = _load_project(inp.project_name)
+    proj.trim_clip(inp.producer_id, inp.in_s, inp.out_s)
+    _save_project(proj, inp.project_name)
+    return _ok({"producer_id": inp.producer_id, "duration_s": round(proj.project_duration_s(), 3)})
+
+
+async def _remove_clip(inp: RemoveClipInput) -> list[TextContent]:
+    proj = _load_project(inp.project_name)
+    proj.remove_clip(inp.producer_id)
+    _save_project(proj, inp.project_name)
+    return _ok({"removed": inp.producer_id, "duration_s": round(proj.project_duration_s(), 3)})
+
+
+async def _move_clip(inp: MoveClipInput) -> list[TextContent]:
+    proj = _load_project(inp.project_name)
+    proj.move_clip(inp.producer_id, inp.to_position)
+    _save_project(proj, inp.project_name)
+    return _ok({"producer_id": inp.producer_id, "position": inp.to_position})
 
 
 async def _split_clip(inp: SplitClipInput) -> list[TextContent]:
     proj = _load_project(inp.project_name)
-    try:
-        left_id, right_id = proj.split_clip(inp.producer_id, inp.at_s)
-    except KeyError:
-        return _err(f"Producer not found: {inp.producer_id}", "producer_not_found")
-    _save_project(proj)
-    return [TextContent(type="text", text=json.dumps({
-        "left_producer_id": left_id,
-        "right_producer_id": right_id,
-    }))]
+    left_id, right_id = proj.split_clip(inp.producer_id, inp.at_s)
+    _save_project(proj, inp.project_name)
+    return _ok({"left_producer_id": left_id, "right_producer_id": right_id})
 
 
 async def _remove_segment(inp: RemoveSegmentInput) -> list[TextContent]:
     if inp.start_s >= inp.end_s:
         return _err("start_s must be less than end_s", "invalid_segment")
     proj = _load_project(inp.project_name)
-    removed = inp.end_s - inp.start_s
     proj.remove_segment(inp.start_s, inp.end_s)
-    _save_project(proj)
-    return [TextContent(type="text", text=json.dumps({"removed_duration_s": removed}))]
+    _save_project(proj, inp.project_name)
+    return _ok({"removed_duration_s": inp.end_s - inp.start_s})
 
 
 async def _append_text_overlay(inp: AppendTextOverlayInput) -> list[TextContent]:
     proj = _load_project(inp.project_name)
-    proj.append_text_overlay(
-        text=inp.text,
-        start_s=inp.start_s,
-        end_s=inp.end_s,
-        font_size=inp.font_size,
-        color=inp.color,
-        bg_color=inp.bg_color,
-        halign=inp.halign,
-        valign=inp.valign,
+    overlay_id = proj.append_text_overlay(
+        text=inp.text, start_s=inp.start_s, end_s=inp.end_s, font_size=inp.font_size,
+        color=inp.color, bg_color=inp.bg_color, halign=inp.halign, valign=inp.valign,
     )
-    _save_project(proj)
-    return [TextContent(type="text", text=json.dumps({
-        "text": inp.text,
-        "start_s": inp.start_s,
-        "end_s": inp.end_s,
-    }))]
+    _save_project(proj, inp.project_name)
+    return _ok({"overlay_id": overlay_id, "text": inp.text, "start_s": inp.start_s, "end_s": inp.end_s})
 
 
 async def _apply_filter(inp: ApplyFilterInput) -> list[TextContent]:
     if inp.filter_name not in ALLOWED_FILTERS:
-        return _err(
-            f"Filter '{inp.filter_name}' not allowed. Allowed: {sorted(ALLOWED_FILTERS)}",
-            "invalid_filter",
-        )
+        return _err(f"Filter '{inp.filter_name}' not allowed. Allowed: {sorted(ALLOWED_FILTERS)}", "invalid_filter")
     proj = _load_project(inp.project_name)
-    try:
-        proj.apply_filter(inp.producer_id, inp.filter_name, inp.params)
-    except KeyError:
-        return _err(f"Producer not found: {inp.producer_id}", "producer_not_found")
-    _save_project(proj)
-    return [TextContent(type="text", text=json.dumps({
-        "producer_id": inp.producer_id,
-        "filter_name": inp.filter_name,
-        "params": inp.params,
-    }))]
+    proj.apply_filter(inp.producer_id, inp.filter_name, inp.params)
+    _save_project(proj, inp.project_name)
+    return _ok({"producer_id": inp.producer_id, "filter_name": inp.filter_name, "params": inp.params})
 
 
 async def _set_transition(inp: SetTransitionInput) -> list[TextContent]:
     proj = _load_project(inp.project_name)
-    try:
-        proj.set_transition(
-            from_producer_id=inp.from_producer_id,
-            to_producer_id=inp.to_producer_id,
-            duration_s=inp.duration_s,
-            style=inp.style,
-        )
-    except KeyError as e:
-        return _err(f"Producer not found: {e}", "producer_not_found")
-    _save_project(proj)
-    return [TextContent(type="text", text=json.dumps({
-        "from_producer_id": inp.from_producer_id,
-        "to_producer_id": inp.to_producer_id,
-        "duration_s": inp.duration_s,
-    }))]
+    proj.set_transition(inp.from_producer_id, inp.to_producer_id, inp.duration_s, inp.style)
+    _save_project(proj, inp.project_name)
+    return _ok({"from_producer_id": inp.from_producer_id, "to_producer_id": inp.to_producer_id,
+                "duration_s": inp.duration_s, "timeline_duration_s": round(proj.project_duration_s(), 3)})
+
+
+async def _get_timeline(inp: GetTimelineInput) -> list[TextContent]:
+    proj = _load_project(inp.project_name)
+    return _ok({"project_path": str(_project_path(inp.project_name)), **proj.timeline()})
 
 
 async def _project_info(inp: ProjectInfoInput) -> list[TextContent]:
     proj = _load_project(inp.project_name)
-    path = str(_project_path(inp.project_name))
-    return [TextContent(type="text", text=json.dumps({
-        "project_path": path,
-        "name": proj.name,
-        "width": proj.width,
-        "height": proj.height,
-        "fps": proj.fps,
-        "duration_s": proj.project_duration_s(),
-        "clip_count": len(proj._clips),
-    }))]
+    return _ok({"project_path": str(_project_path(inp.project_name)), "name": proj.name,
+                "width": proj.width, "height": proj.height, "fps": proj.fps,
+                "duration_s": round(proj.project_duration_s(), 3), "clip_count": len(proj._clips)})
 
 
 async def _render(inp: RenderInput) -> list[TextContent]:
     if inp.preset not in RENDER_PRESETS:
-        return _err(
-            f"Unknown preset '{inp.preset}'. Valid: {list(RENDER_PRESETS.keys())}",
-            "invalid_preset",
-        )
+        return _err(f"Unknown preset '{inp.preset}'. Valid: {list(RENDER_PRESETS.keys())}", "invalid_preset")
     proj = _load_project(inp.project_name)
+    if not proj._clips:
+        return _err("Project has no clips", "render_failed")
     mlt_path = str(_project_path(inp.project_name))
-    preset_args = RENDER_PRESETS[inp.preset]
+    consumer_args = [f"{k}={v}" for k, v in RENDER_PRESETS[inp.preset].items()]
+    cmd = [MELT_BIN, "-quiet", mlt_path, "-consumer", f"avformat:{inp.output_path}",
+           "real_time=-1", "terminate_on_pause=1"] + consumer_args
 
-    consumer_args = [f"{k}={v}" for k, v in preset_args.items()]
-    cmd = [MELT_BIN, mlt_path, "-consumer", f"avformat:{inp.output_path}"] + consumer_args
-
-    import time
     t0 = time.time()
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=3600,
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-    except subprocess.TimeoutExpired:
-        return _err("melt render timed out after 3600s", "render_failed")
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=3600)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return _err("melt render timed out after 3600s", "render_failed")
     except FileNotFoundError:
         return _err(f"melt binary not found: {MELT_BIN}", "render_failed")
 
     elapsed = time.time() - t0
-
-    if result.returncode != 0:
-        stderr_tail = "\n".join(result.stderr.splitlines()[-10:])
-        return _err(
-            f"melt exited {result.returncode}:\n{stderr_tail}",
-            "render_failed",
-        )
-
     out_path = Path(inp.output_path)
-    file_size = out_path.stat().st_size if out_path.exists() else 0
+    if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        tail = "\n".join(stderr.decode(errors="replace").splitlines()[-10:])
+        return _err(f"melt exited {proc.returncode}:\n{tail}", "render_failed")
 
-    return [TextContent(type="text", text=json.dumps({
-        "output_path": inp.output_path,
-        "preset": inp.preset,
-        "duration_s": round(elapsed, 2),
-        "file_size_bytes": file_size,
-    }))]
+    return _ok({"output_path": inp.output_path, "preset": inp.preset, "render_time_s": round(elapsed, 2),
+                "file_size_bytes": out_path.stat().st_size,
+                "rendered_duration_s": probe_duration_s(inp.output_path),
+                "timeline_duration_s": round(proj.project_duration_s(), 3)})
 
 
 async def _list_projects(inp: ListProjectsInput) -> list[TextContent]:
     _ensure_workdir()
-    projects = []
-    for p in sorted(WORKDIR.glob("*.mlt")):
-        projects.append({
-            "name": p.stem,
-            "path": str(p),
-            "size_bytes": p.stat().st_size,
-        })
-    return [TextContent(type="text", text=json.dumps({"projects": projects}))]
+    projects = [{"name": p.stem, "path": str(p), "size_bytes": p.stat().st_size}
+                for p in sorted(WORKDIR.glob("*.mlt"))]
+    return _ok({"projects": projects})
 
 
 def main() -> None:
