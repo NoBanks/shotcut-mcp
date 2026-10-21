@@ -1,0 +1,38 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI trusted publishing and MCP Registry OIDC login
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Check tag matches package version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          grep -q "^version = \"$TAG\"" pyproject.toml
+          grep -q "\"version\": \"$TAG\"" server.json
+      - name: Install melt and ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y melt ffmpeg
+      - name: Run tests
+        run: pip install -e ".[dev]" && pytest -v
+      - name: Build
+        run: pip install build && python -m build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+      - name: Log in to MCP Registry
+        run: ./mcp-publisher login github-oidc
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish

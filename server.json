@@ -1,0 +1,38 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.NoBanks/shotcut-mcp",
+  "title": "Shotcut MCP",
+  "description": "Edit video through Shotcut's MLT engine: timelines, cuts, filters, titles, crossfades and renders.",
+  "repository": {
+    "url": "https://github.com/NoBanks/shotcut-mcp",
+    "source": "github"
+  },
+  "version": "0.2.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "shotcut-mcp",
+      "version": "0.2.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SHOTCUT_MCP_WORKDIR",
+          "description": "Directory for .mlt projects and state files (default ~/shotcut-mcp-projects)",
+          "isRequired": false
+        },
+        {
+          "name": "MELT_BIN",
+          "description": "Path to the MLT melt binary if it is not on PATH",
+          "isRequired": false
+        },
+        {
+          "name": "FFPROBE_BIN",
+          "description": "Path to ffprobe if it is not on PATH",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
