@@ -4,10 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shotcut-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "MCP server for Shotcut/MLT video editing - programmatic timelines, cuts, filters, and renders via melt"
 readme = "README.md"
 license = {text = "MIT"}
+authors = [{ name = "NoBanks Nearby" }]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video :: Non-Linear Editor",
+    "Intended Audience :: Developers",
+]
 requires-python = ">=3.11"
 keywords = ["mcp", "shotcut", "mlt", "video-editing", "goose", "ai-agents"]
 dependencies = [
