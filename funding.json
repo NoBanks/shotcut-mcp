@@ -1,0 +1,50 @@
+{
+  "version": "v1.0.0",
+  "entity": {
+    "type": "individual",
+    "role": "maintainer",
+    "name": "NoBanks (Ryan Hammer)",
+    "email": "nobanksnearby@gmail.com",
+    "description": "Independent developer who writes and maintains shotcut-mcp.",
+    "webpageUrl": {
+      "url": "https://github.com/NoBanks"
+    }
+  },
+  "projects": [
+    {
+      "guid": "shotcut-mcp",
+      "name": "shotcut-mcp",
+      "description": "MCP server that edits video through Shotcut's engine, MLT, with no GUI. An agent can create a project, add and trim clips, split, move and remove them, apply filters, add titles and crossfades, read the timeline back and render it with melt. The output is a native Shotcut .mlt project that can be opened and edited by hand in Shotcut.",
+      "webpageUrl": {
+        "url": "https://github.com/NoBanks/shotcut-mcp"
+      },
+      "repositoryUrl": {
+        "url": "https://github.com/NoBanks/shotcut-mcp"
+      },
+      "licenses": ["spdx:MIT"],
+      "tags": ["mcp", "shotcut", "mlt", "video-editing", "ai-agents", "python"]
+    }
+  ],
+  "funding": {
+    "channels": [
+      {
+        "guid": "email-contact",
+        "type": "other",
+        "address": "nobanksnearby@gmail.com",
+        "description": "Contact the maintainer by email to arrange support."
+      }
+    ],
+    "plans": [
+      {
+        "guid": "maintainer-support",
+        "status": "active",
+        "name": "Maintainer support",
+        "description": "Monthly support for maintenance, bug fixes, and compatibility with new Shotcut, MLT, and MCP releases.",
+        "amount": 100,
+        "currency": "USD",
+        "frequency": "monthly",
+        "channels": ["email-contact"]
+      }
+    ]
+  }
+}
