@@ -208,6 +208,14 @@ class MltProject:
         new_out = clip["out_s"] if out_s is None else float(out_s)
         if new_in < 0 or (new_out is not None and new_out <= new_in):
             raise ValueError(f"Invalid trim: in_s={new_in}, out_s={new_out}")
+        candidate = {**clip, "in_s": new_in, "out_s": new_out}
+        for transition in self._transitions:
+            if producer_id in (transition["from_id"], transition["to_id"]):
+                if self._clip_len(candidate) < transition["duration_s"] * 2:
+                    raise ValueError(
+                        f"Clip {producer_id} is too short for its existing "
+                        f"{transition['duration_s']}s crossfade"
+                    )
         clip["in_s"], clip["out_s"] = new_in, new_out
 
     def remove_clip(self, producer_id: str) -> None:
